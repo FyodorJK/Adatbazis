@@ -1,0 +1,336 @@
+-- Table-ök (Könyv, vásárló, rendelés, rendelés tétele, számla) + particionálás
+
+CREATE TABLE Konyv (
+    konyv_id SERIAL PRIMARY KEY,
+    konyv_cime VARCHAR(255),
+    konyv_iroja VARCHAR(255),
+    konyv_kiadasDatuma DATE,
+    konyv_ara DECIMAL(10, 2),
+    konyv_mennyisege INT,	
+    konyv_elerhetoE BOOLEAN
+);
+
+CREATE TABLE Vasarlo (
+    vasarlo_id SERIAL,
+    vasarlo_neve VARCHAR(255),
+    vasarlo_elerhetosege VARCHAR(255),
+    vasarlo_varosa VARCHAR(255),
+    vasarlo_cime VARCHAR(255),
+    PRIMARY KEY (vasarlo_id, vasarlo_varosa)
+) PARTITION BY LIST (vasarlo_varosa);
+
+CREATE TABLE Vasarlok_Budapest PARTITION OF Vasarlo
+    FOR VALUES IN ('Budapest');
+
+CREATE TABLE Vasarlok_Debrecen PARTITION OF Vasarlo
+    FOR VALUES IN ('Debrecen');
+
+CREATE TABLE Vasarlok_Szeged PARTITION OF Vasarlo
+    FOR VALUES IN ('Szeged');
+
+CREATE TABLE Vasarlok_Esztergom PARTITION OF Vasarlo
+    FOR VALUES IN ('Esztergom');
+
+CREATE TABLE Vasarlok_Egyeb PARTITION OF Vasarlo
+    DEFAULT;
+
+CREATE TABLE Rendeles (
+    rendeles_id SERIAL PRIMARY KEY,
+    vasarlo_id INT,
+    vasarlo_varosa VARCHAR(255),
+    rendeles_datuma DATE,
+    rendeles_allapota BOOLEAN,
+    FOREIGN KEY (vasarlo_id, vasarlo_varosa) REFERENCES Vasarlo(vasarlo_id, vasarlo_varosa)
+);
+
+CREATE TABLE RendelesTetelek (
+    rendelesTetelek_id SERIAL PRIMARY KEY,
+    rendeles_id INT REFERENCES Rendeles(rendeles_id),
+    konyv_id INT REFERENCES Konyv(konyv_id),
+    rendelesTetelek_mennyiseg INT
+);
+
+CREATE TABLE Szamla (
+    szamla_id SERIAL PRIMARY KEY,
+    rendeles_id INT REFERENCES Rendeles(rendeles_id),
+    szamla_datuma DATE,
+    szamla_teljesAr DECIMAL(10, 2)
+);
+
+
+-- Pár sor beszúrása
+
+INSERT INTO Konyv (konyv_cime, konyv_iroja, konyv_kiadasDatuma, konyv_ara, konyv_mennyisege, konyv_elerhetoE)
+VALUES ('A Nagy Kaland', 'John Doe', '2023-01-10', 2500.00, 50, TRUE),
+       ('Bűnös Történetek', 'Jane Smith', '2022-11-23', 3000.00, 30, TRUE),
+       ('Szép Emlékek', 'Mark Adams', '2021-06-15', 3500.00, 70, TRUE),
+       ('A valami', 'Olajos Péter', '2010-01-28', 2300.00, 100, TRUE),
+       ('A Titok', 'Eva Green', '2020-04-25', 2000.00, 0, FALSE);
+
+INSERT INTO Vasarlo (vasarlo_neve, vasarlo_elerhetosege, vasarlo_varosa, vasarlo_cime)
+VALUES ('John Doe', 'johndoe@email.com', 'Budapest', 'Kossuth Lajos utca 1'),
+       ('Jane Smith', 'janesmith@email.com', 'Debrecen', 'Virág utca 3'),
+       ('Balázs Károly', 'balazs@email.com', 'Szeged', 'Rókus utca 7'),
+       ('Anna Kovács', 'anna@email.com', 'Budapest', 'Petőfi utca 12');
+
+INSERT INTO Rendeles (vasarlo_id, vasarlo_varosa, rendeles_datuma, rendeles_allapota)
+VALUES (1, 'Budapest', '2023-12-01', TRUE),
+       (2, 'Debrecen', '2023-11-20', FALSE),
+       (3, 'Szeged', '2023-12-05', TRUE),
+       (3, 'Szeged', '2023-12-06', TRUE),
+       (4, 'Budapest', '2023-10-12', TRUE);
+
+INSERT INTO RendelesTetelek (rendeles_id, konyv_id, rendelesTetelek_mennyiseg)
+VALUES (1, 1, 2),
+       (2, 2, 1),
+       (3, 3, 3),
+       (3, 2, 1),
+       (4, 4, 5);
+
+
+-- Lekérdezések (könyvek elérhetősége, vásárlók vásárlási előzményei, rendelések státusza)
+
+SELECT konyv_cime
+FROM Konyv
+WHERE konyv_elerhetoE = TRUE;
+
+SELECT v.vasarlo_neve, r.rendeles_datuma, k.konyv_cime, rt.rendelesTetelek_mennyiseg
+FROM Vasarlo v
+JOIN Rendeles r ON v.vasarlo_id = r.vasarlo_id
+JOIN RendelesTetelek rt ON r.rendeles_id = rt.rendeles_id
+JOIN Konyv k ON rt.konyv_id = k.konyv_id
+ORDER BY r.rendeles_datuma DESC;
+
+SELECT r.rendeles_id, r.rendeles_allapota
+FROM Rendeles r
+JOIN Vasarlo V ON R.vasarlo_id = V.vasarlo_id AND R.vasarlo_varosa = V.vasarlo_varosa;
+
+
+-- Trigger (könyv készlet/mennyiség frissitése)
+
+CREATE OR REPLACE FUNCTION konyv_keszletFrissitese() RETURNS TRIGGER AS $$
+BEGIN
+	IF (SELECT konyv_mennyisege FROM Konyv WHERE konyv_id = NEW.konyv_id) < NEW.rendelesTetelek_mennyiseg THEN
+        RAISE EXCEPTION 'Nincsen elegendo mennyiseg a konyv_id %', NEW.konyv_id;
+    END IF;
+
+    IF EXISTS (SELECT 1 FROM Rendeles WHERE rendeles_id = NEW.rendeles_id AND rendeles_allapota = TRUE) THEN
+        UPDATE Konyv
+        SET konyv_mennyisege = konyv_mennyisege - NEW.rendelesTetelek_mennyiseg
+        WHERE konyv_id = NEW.konyv_id;
+
+        UPDATE Konyv
+        SET konyv_elerhetoE = FALSE
+        WHERE konyv_id = NEW.konyv_id AND konyv_mennyisege <= 0;
+    END IF;
+
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_konyvFrissitese
+AFTER INSERT ON RendelesTetelek
+FOR EACH ROW
+EXECUTE FUNCTION konyv_keszletFrissitese();
+
+
+-- Tárolt eljárások (legjobban fogyó könyvek, legaktívabb vásárlók, számla generáló)
+
+CREATE OR REPLACE PROCEDURE legjobban_fogyoKonyvek(limite INT DEFAULT 3)
+LANGUAGE plpgsql AS $$
+BEGIN
+    DROP TABLE IF EXISTS legjobban_fogyoKonyvek_t;
+
+    CREATE TEMP TABLE legjobban_fogyoKonyvek_t(
+        konyv_id INT,
+        konyv_cime TEXT,
+        osszes_eladott_konyv INT
+    ) ON COMMIT PRESERVE ROWS;
+
+    INSERT INTO legjobban_fogyoKonyvek_t (konyv_id, konyv_cime, osszes_eladott_konyv)
+    SELECT 
+        k.konyv_id,
+        k.konyv_cime,
+        SUM(t.rendelesTetelek_mennyiseg)::INT AS osszes_eladott_konyv
+    FROM RendelesTetelek t
+    JOIN Konyv k ON t.konyv_id = k.konyv_id
+    GROUP BY k.konyv_id, k.konyv_cime
+    ORDER BY osszes_eladott_konyv DESC
+    LIMIT limite;
+END;
+$$;
+
+CALL legjobban_fogyoKonyvek(3);
+SELECT * FROM legjobban_fogyoKonyvek_t;
+
+CREATE OR REPLACE PROCEDURE legaktivabb_vasarlok(limit_szam INT DEFAULT 3)
+LANGUAGE plpgsql AS $$
+BEGIN
+    DROP TABLE IF EXISTS legaktivabb_vasarlok_t;
+
+    CREATE TEMP TABLE legaktivabb_vasarlok_t (
+        vasarlo_id INT,
+        teljes_nev TEXT,
+        osszes_eladott INT
+    ) ON COMMIT PRESERVE ROWS;
+
+    INSERT INTO legaktivabb_vasarlok_t (vasarlo_id, teljes_nev, osszes_eladott)
+    SELECT 
+        v.vasarlo_id,
+        v.vasarlo_neve,
+        COUNT(r.rendeles_id)::INT AS osszes_eladott
+    FROM Rendeles r
+    JOIN Vasarlo v ON r.vasarlo_id = v.vasarlo_id
+    GROUP BY v.vasarlo_id, v.vasarlo_neve
+    ORDER BY osszes_eladott DESC
+    LIMIT limit_szam;
+END;
+$$;
+
+CALL legaktivabb_vasarlok(3);
+SELECT * FROM legaktivabb_vasarlok_t;
+
+CREATE OR REPLACE PROCEDURE szamla_generalo(rendeles_id_input INT)
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    teljes_osszeg DECIMAL(10, 2);
+    szamla_letezik BOOLEAN;
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM Rendeles WHERE rendeles_id = rendeles_id_input AND rendeles_allapota = TRUE) THEN
+        RAISE EXCEPTION 'A rendelés (%), nincs teljesítve, így nem lehet számlát generálni.', rendeles_id_input;
+    END IF;
+
+    SELECT EXISTS (
+        SELECT 1 FROM Szamla WHERE rendeles_id = rendeles_id_input
+    ) INTO szamla_letezik;
+
+    IF szamla_letezik THEN
+        RAISE NOTICE 'Ehhez a rendeléshez (%), már létezik számla.', rendeles_id_input;
+        RETURN;
+    END IF;
+
+    SELECT SUM(k.konyv_ara * t.rendelesTetelek_mennyiseg)
+    INTO teljes_osszeg
+    FROM RendelesTetelek t
+    JOIN Konyv k ON t.konyv_id = k.konyv_id
+    WHERE t.rendeles_id = rendeles_id_input;
+
+    IF teljes_osszeg IS NULL THEN
+        RAISE EXCEPTION 'A megadott rendelés (%), nem tartalmaz tételeket.', rendeles_id_input;
+    END IF;
+
+    INSERT INTO Szamla (rendeles_id, szamla_teljesAr, szamla_datuma)
+    VALUES (rendeles_id_input, teljes_osszeg, CURRENT_DATE);
+END;
+$$;
+
+DO $$
+DECLARE
+    i INT;
+BEGIN
+    FOR i IN 1..5 LOOP
+        CALL szamla_generalo(i);
+    END LOOP;
+END;
+$$;
+
+
+-- 10000 sor generálása
+
+INSERT INTO Konyv (konyv_cime, konyv_iroja, konyv_kiadasDatuma, konyv_ara, konyv_mennyisege, konyv_elerhetoE)
+SELECT
+    'Konyv ' || i AS konyv_cime,
+    'Szerzo ' || i AS konyv_iroja,
+    NOW() - (INTERVAL '1 day' * (RANDOM() * 1000)::INT) AS konyv_kiadasDatuma,
+    RANDOM() * 1000 + 1000 AS konyv_ara,
+    (RANDOM() * 600 + 50)::INT AS konyv_mennyisege,
+    TRUE
+FROM generate_series(1, 10000) AS i;
+
+INSERT INTO Vasarlo (vasarlo_neve, vasarlo_elerhetosege, vasarlo_varosa, vasarlo_cime)
+SELECT
+    'Vasarlo ' || (i % 8) AS vasarlo_neve,
+    'email' || i || '@email.com' AS vasarlo_elerhetosege,
+    CASE WHEN (i % 4) = 0 THEN 'Budapest' 
+         WHEN (i % 4) = 1 THEN 'Debrecen'
+         WHEN (i % 4) = 2 THEN 'Szeged'
+         WHEN (i % 4) = 3 THEN 'Esztergom'
+         ELSE 'Sopron' END AS vasarlo_varosa,
+    'Utca ' || i AS vasarlo_cime
+FROM generate_series(1, 10000) AS i;
+
+INSERT INTO Rendeles (vasarlo_id, vasarlo_varosa,rendeles_datuma, rendeles_allapota)
+SELECT
+    v.vasarlo_id,
+    v.vasarlo_varosa, 
+    NOW() - (INTERVAL '1 day' * (RANDOM() * 100)::INT),
+    CASE WHEN i % 2 = 0 THEN TRUE ELSE FALSE END
+FROM generate_series(1, 10000) AS i
+JOIN Vasarlo v ON v.vasarlo_id = ((i % (SELECT COUNT(*) FROM Vasarlo)) + 1);
+
+INSERT INTO RendelesTetelek (rendeles_id, konyv_id, rendelesTetelek_mennyiseg)
+SELECT
+    (i % 5000) + 1 AS rendeles_id,
+    (i % 5000) + 1 AS konyv_id, 
+    LEAST((RANDOM() * 10 + 1)::INT, k.konyv_mennyisege) AS rendelesTetelek_mennyiseg 
+FROM generate_series(1, 10000) AS i
+JOIN Konyv k ON k.konyv_id = (i % 5000) + 1
+WHERE LEAST((RANDOM() * 10 + 1)::INT, k.konyv_mennyisege) <= k.konyv_mennyisege;
+
+
+-- Teljesítmény analízis
+
+SELECT 
+    r.rendeles_id, 
+    r.rendeles_datuma, 
+    v.vasarlo_neve, 
+    v.vasarlo_varosa, 
+    k.konyv_cime, 
+    rt.rendelesTetelek_mennyiseg
+FROM Rendeles r
+JOIN Vasarlo v ON r.vasarlo_id = v.vasarlo_id AND r.vasarlo_varosa = v.vasarlo_varosa
+JOIN RendelesTetelek rt ON r.rendeles_id = rt.rendeles_id
+JOIN Konyv k ON rt.konyv_id = k.konyv_id
+WHERE v.vasarlo_varosa = 'Debrecen'
+  AND r.rendeles_allapota = TRUE AND r.rendeles_datuma >= '2024-09-01'::DATE AND r.rendeles_datuma < '2024-10-01'::DATE
+ORDER BY r.rendeles_datuma DESC;
+
+
+explain analyze SELECT 
+    r.rendeles_id, 
+    r.rendeles_datuma, 
+    v.vasarlo_neve, 
+    v.vasarlo_varosa, 
+    k.konyv_cime, 
+    rt.rendelesTetelek_mennyiseg
+FROM Rendeles r
+JOIN Vasarlo v ON r.vasarlo_id = v.vasarlo_id AND r.vasarlo_varosa = v.vasarlo_varosa
+JOIN RendelesTetelek rt ON r.rendeles_id = rt.rendeles_id
+JOIN Konyv k ON rt.konyv_id = k.konyv_id
+WHERE v.vasarlo_varosa = 'Debrecen'
+  AND r.rendeles_allapota = TRUE AND r.rendeles_datuma >= '2024-09-01'::DATE AND r.rendeles_datuma < '2024-10-01'::DATE
+ORDER BY r.rendeles_datuma DESC;
+
+
+CREATE INDEX IF NOT EXISTS rendeles_teljesitettSzeptember
+ON Rendeles (rendeles_datuma, rendeles_allapota)
+WHERE rendeles_allapota = TRUE 
+  AND rendeles_datuma >= '2024-09-01'::DATE
+  AND rendeles_datuma < '2024-10-01'::DATE;
+
+explain analyze SELECT 
+    r.rendeles_id, 
+    r.rendeles_datuma, 
+    v.vasarlo_neve, 
+    v.vasarlo_varosa, 
+    k.konyv_cime, 
+    rt.rendelesTetelek_mennyiseg
+FROM Rendeles r
+JOIN Vasarlo v ON r.vasarlo_id = v.vasarlo_id AND r.vasarlo_varosa = v.vasarlo_varosa
+JOIN RendelesTetelek rt ON r.rendeles_id = rt.rendeles_id
+JOIN Konyv k ON rt.konyv_id = k.konyv_id
+WHERE v.vasarlo_varosa = 'Debrecen'
+  AND r.rendeles_allapota = TRUE AND r.rendeles_datuma >= '2024-09-01'::DATE AND r.rendeles_datuma < '2024-10-01'::DATE
+ORDER BY r.rendeles_datuma DESC;
+
